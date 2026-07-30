@@ -1,0 +1,251 @@
+(ns asn1.core-test
+  "The property everything here exists for: what decodes must re-encode to the
+  same bytes, and what DER forbids must not decode at all.
+
+  The fixtures are real DER — an X.509 AlgorithmIdentifier, a certificate's
+  validity, a CMS content type attribute — pasted as hex rather than constructed
+  by this library, so a bug that is symmetric between `encode` and `decode`
+  cannot hide behind a round trip through both."
+  (:require [clojure.test :refer [deftest is testing]]
+            [asn1.core :as asn1]
+            [asn1.oid :as oid]))
+
+;; ── round trips over real DER ────────────────────────────────────────────────
+
+(def ^:private fixtures
+  {"AlgorithmIdentifier sha256WithRSAEncryption"
+   "300d06092a864886f70d01010b0500"
+
+   "Validity (two UTCTimes)"
+   "301e170d3236303733303030303030305a170d3237303733303030303030305a"
+
+   "SET OF one attribute (contentType = data)"
+   "311a301806092a864886f70d010903310b06092a864886f70d010701"
+
+   "INTEGER 0"
+   "020100"
+
+   "INTEGER with a high bit, needing the leading 00"
+   "0202 00 ff"
+
+   "negative INTEGER"
+   "0201 80"
+
+   "BIT STRING with 3 unused bits"
+   "0304 03 6e 5d c0"
+
+   "long-form length (200 content octets)"
+   (str "0481c8" (apply str (repeat 200 "41")))
+
+   "context [0] EXPLICIT wrapping an OCTET STRING"
+   "a0060404deadbeef"
+
+   "high tag number (context [31])"
+   "bf1f03020100"})
+
+(deftest real-der-round-trips-byte-for-byte
+  (doseq [[label hex] fixtures]
+    (testing label
+      (is (asn1/der-round-trips? (asn1/unhex hex))
+          (str "did not round trip: " label)))))
+
+(deftest decoding-reads-the-structure
+  (testing "AlgorithmIdentifier: an OID and an explicit NULL parameter"
+    (let [alg (asn1/decode (asn1/unhex "300d06092a864886f70d01010b0500"))]
+      (is (= :sequence (:asn1/type alg)))
+      (is (= 2 (count (:asn1/elements alg))))
+      (is (= (oid/dotted :sha256-with-rsa)
+             (asn1/oid-value (asn1/nth-element alg 0))))
+      (is (= :sha256-with-rsa
+             (oid/named (asn1/oid-value (asn1/nth-element alg 0)))))
+      (is (= :null (:asn1/type (asn1/nth-element alg 1))))))
+
+  (testing "UTCTime gets RFC 5280's two-digit-year window, as a string"
+    (let [validity (asn1/decode
+                    (asn1/unhex "301e170d3236303733303030303030305a170d3237303733303030303030305a"))]
+      (is (= "2026-07-30T00:00:00Z" (asn1/time-value (asn1/nth-element validity 0))))
+      (is (= "2027-07-30T00:00:00Z" (asn1/time-value (asn1/nth-element validity 1))))))
+
+  (testing "a 1990s UTCTime lands in the 20th century, not 2091"
+    (is (= "1991-01-02T03:04:05Z"
+           (asn1/time-value (asn1/decode (asn1/unhex "170d3931303130323033303430355a"))))))
+
+  (testing "BIT STRING keeps its pad count — the bit length is not in the octets"
+    (is (= {:unused-bits 3 :ints [0x6e 0x5d 0xc0]}
+           (asn1/bit-string-value (asn1/decode (asn1/unhex "0304036e5dc0"))))))
+
+  (testing "context tags are found by tag, not by position"
+    (let [seq* (asn1/decode (asn1/unhex "300da0030101ffa206040404020000"))]
+      (is (asn1/context-tag? (asn1/find-context seq* 0) 0))
+      (is (some? (asn1/find-context seq* 2)))
+      (is (nil? (asn1/find-context seq* 1))))))
+
+;; ── the BER forms that must be refused ───────────────────────────────────────
+
+(deftest ber-is-refused-because-a-signature-is-over-bytes
+  (testing "indefinite length"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                          #"indefinite length"
+                          (asn1/decode (asn1/unhex "3080020100 0000")))))
+
+  (testing "non-minimal long-form length (0x81 0x05 for a length of 5)"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                 (asn1/decode (asn1/unhex "04810541424344 45")))))
+
+  (testing "long-form length with a leading zero octet"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                 (asn1/decode (asn1/unhex (str "048200c8" (apply str (repeat 200 "41"))))))))
+
+  (testing "constructed OCTET STRING — the same octets would have many encodings"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                          #"constructed octet-string"
+                          (asn1/decode (asn1/unhex "24 06 0402 4142 0402 4344")))))
+
+  (testing "trailing bytes after the outermost element"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                          #"bytes remain"
+                          (asn1/decode (asn1/unhex "020100 020100")))))
+
+  (testing "truncated content"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                 (asn1/decode (asn1/unhex "0405 4142")))))
+
+  (testing "non-minimal INTEGER is refused when READ, so a modulus cannot arrive twice-spelled"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                          #"redundant leading octet"
+                          (asn1/integer-value (asn1/decode (asn1/unhex "0202 0001")))))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                 (asn1/integer-value (asn1/decode (asn1/unhex "0202 ffff"))))))
+
+  (testing "BOOLEAN 0x01 is BER; DER says true is 0xff"
+    (is (true? (asn1/boolean-value (asn1/decode (asn1/unhex "0101ff")))))
+    (is (false? (asn1/boolean-value (asn1/decode (asn1/unhex "010100")))))
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                          #"0x00 or 0xff"
+                          (asn1/boolean-value (asn1/decode (asn1/unhex "010101")))))))
+
+;; ── INTEGER encoding ─────────────────────────────────────────────────────────
+
+(defn- round-trip-integer [n]
+  (asn1/integer-value (asn1/decode (asn1/encode-ints (asn1/integer n)))))
+
+(deftest integer-encoding
+  (testing "the leading 0x00 appears exactly when the high bit would make it negative"
+    (is (= "020100" (asn1/hex (asn1/encode-ints (asn1/integer 0)))))
+    (is (= "02017f" (asn1/hex (asn1/encode-ints (asn1/integer 127)))))
+    (is (= "02020080" (asn1/hex (asn1/encode-ints (asn1/integer 128)))))
+    (is (= "020200ff" (asn1/hex (asn1/encode-ints (asn1/integer 255))))))
+  (testing "negatives are two's complement and also minimal"
+    (is (= "0201ff" (asn1/hex (asn1/encode-ints (asn1/integer -1)))))
+    (is (= "020180" (asn1/hex (asn1/encode-ints (asn1/integer -128)))))
+    (is (= "0202ff7f" (asn1/hex (asn1/encode-ints (asn1/integer -129))))))
+  (testing "values round trip"
+    (doseq [n [0 1 127 128 255 256 65535 65536 -1 -127 -128 -129 -65536 1000000007]]
+      (is (= n (round-trip-integer n)) (str "round trip " n)))))
+
+;; ── OID ──────────────────────────────────────────────────────────────────────
+
+(deftest oid-codec
+  (testing "the first two arcs share one septet group"
+    (is (= "06092a864886f70d01010b"
+           (asn1/hex (asn1/encode-ints (asn1/oid "1.2.840.113549.1.1.11")))))
+    (is (= "1.2.840.113549.1.1.11"
+           (asn1/oid-value (asn1/decode (asn1/unhex "06092a864886f70d01010b"))))))
+
+  (testing "sha256, which starts 2.16 and so exercises the >80 branch"
+    (is (= "2.16.840.1.101.3.4.2.1"
+           (asn1/oid-value (asn1/decode (asn1/encode-ints (asn1/oid (oid/dotted :sha256))))))))
+
+  (testing "ed25519's short arc"
+    (is (= "1.3.101.112"
+           (asn1/oid-value (asn1/decode (asn1/encode-ints (asn1/oid "1.3.101.112")))))))
+
+  (testing "every OID in the registry survives a round trip"
+    (doseq [[name-kw dotted] oid/oids]
+      (is (= dotted (asn1/oid-value (asn1/decode (asn1/encode-ints (asn1/oid dotted)))))
+          (str name-kw))))
+
+  (testing "a leading 0x80 septet is a second spelling of the same arc"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                          #"leading 0x80"
+                          (asn1/oid-value (asn1/decode (asn1/unhex "0603 80 8001"))))))
+
+  (testing "an unknown OID NAME throws rather than becoming nil and matching nothing"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                 (oid/dotted :sha256-with-rsaa)))
+    (is (nil? (oid/named "1.2.3.4.5.6.7"))))
+
+  (testing "describe names what it knows and passes through what it does not"
+    (is (= "sha256-with-rsa (1.2.840.113549.1.1.11)"
+           (oid/describe "1.2.840.113549.1.1.11")))
+    (is (= "1.2.3.4" (oid/describe "1.2.3.4")))))
+
+;; ── SET OF ordering ──────────────────────────────────────────────────────────
+
+(deftest set-of-is-sorted-because-cms-hashes-it
+  (let [a (asn1/octet-string [0x01])
+        b (asn1/octet-string [0x02])
+        c (asn1/octet-string [0x00 0x00])]
+    (testing "the encoding does not depend on the order the caller passed"
+      (is (= (asn1/hex (asn1/encode-ints (asn1/set-of [a b c])))
+             (asn1/hex (asn1/encode-ints (asn1/set-of [c b a])))
+             (asn1/hex (asn1/encode-ints (asn1/set-of [b a c]))))))
+    (testing "and it is sorted by encoded value, shortest-differing-byte first"
+      ;; 04 01 01 < 04 01 02 < 04 02 00 00 byte by byte. Not by length: see
+      ;; `octets<` for the case where the two rules disagree.
+      (is (= "310a040101040102 04020000"
+             (let [h (asn1/hex (asn1/encode-ints (asn1/set-of [a b c])))]
+               (str (subs h 0 16) " " (subs h 16))))))
+    (testing "SET keeps the caller's order — only SET OF is sorted"
+      (is (not= (asn1/hex (asn1/encode-ints (asn1/set* [a b])))
+                (asn1/hex (asn1/encode-ints (asn1/set* [b a]))))))))
+
+;; ── tagging ──────────────────────────────────────────────────────────────────
+
+(deftest tagging-keeps-what-each-form-is-supposed-to-keep
+  (let [inner (asn1/octet-string [0xde 0xad])]
+    (testing "EXPLICIT keeps the inner tag, so it costs four extra bytes"
+      (is (= "a0040402dead" (asn1/hex (asn1/encode-ints (asn1/explicit 0 inner))))))
+    (testing "IMPLICIT replaces the inner tag"
+      (is (= "8002dead" (asn1/hex (asn1/encode-ints (asn1/implicit 0 inner))))))
+    (testing "IMPLICIT keeps constructedness, which is what distinguishes the forms"
+      (is (= "a003020100"
+             (asn1/hex (asn1/encode-ints (asn1/implicit 0 (asn1/sequence* [(asn1/integer 0)])))))))
+    (testing "unwrap-explicit gets the inner element back"
+      (is (= [0xde 0xad]
+             (:asn1/content
+              (asn1/unwrap-explicit
+               (asn1/decode (asn1/encode-ints (asn1/explicit 0 inner))))))))))
+
+(deftest retag-hashes-the-form-the-spec-says-and-not-the-wire-form
+  ;; This is the CMS signedAttrs rule in miniature: the attributes travel as
+  ;; [0] IMPLICIT and are hashed as a SET. An implementation that reused the
+  ;; parsed bytes would hash 0xa0… and produce a signature nobody can verify.
+  (let [wire (asn1/decode (asn1/unhex "a1050403414243"))
+        as-set (asn1/retag wire :universal 17)]
+    (is (= "a1050403414243" (asn1/hex (asn1/encode-ints wire))))
+    (is (= "31050403414243" (asn1/hex (asn1/encode-ints as-set))))
+    (testing "and the stale :asn1/der is dropped rather than re-emitted"
+      (is (nil? (:asn1/der as-set)))
+      (is (= :set (:asn1/type as-set))))))
+
+;; ── the bytes each element kept ──────────────────────────────────────────────
+
+(deftest every-element-keeps-its-own-der
+  (let [outer (asn1/decode (asn1/unhex "300d06092a864886f70d01010b0500"))
+        alg-oid (asn1/nth-element outer 0)]
+    (testing "a child's :asn1/der is exactly its own TLV, ready to hash"
+      (is (= "06092a864886f70d01010b" (asn1/hex (:asn1/der alg-oid)))))
+    (testing "and the parent's is the whole thing"
+      (is (= "300d06092a864886f70d01010b0500" (asn1/hex (:asn1/der outer)))))
+    (testing "content excludes the tag and length"
+      (is (= "2a864886f70d01010b" (asn1/hex (:asn1/content alg-oid)))))))
+
+(deftest encode-prefers-edited-children-over-cached-content
+  ;; A parsed element carries both :asn1/content and :asn1/elements. If encode
+  ;; trusted the cached content, editing a child would silently produce the
+  ;; original bytes -- which for a signed structure means signing something the
+  ;; caller did not build.
+  (let [parsed (asn1/decode (asn1/unhex "3003020101"))
+        edited (assoc parsed :asn1/elements [(asn1/integer 2)])]
+    (is (= "3003020102" (asn1/hex (asn1/encode-ints edited))))))
