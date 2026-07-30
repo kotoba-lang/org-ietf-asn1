@@ -358,8 +358,33 @@
          (and negative? (zero? (bit-and (first octets) 0x80))) (into [0xff] octets)
          :else octets)))))
 
+(def safe-integer-limit
+  "The largest magnitude `integer-value` will return: 2^53 - 1.
+
+  Not a JVM limit — a portability one. `:cljs` numbers are doubles, so above
+  this an integer silently loses low bits, and an X.509 serial number is up to
+  20 octets. Returning an approximate serial number is worse than refusing:
+  `IssuerAndSerialNumber` matching in CMS compares serials, and two different
+  certificates that round to the same double would match each other.
+
+  Values above it are read with `integer-hex`, which is also how every X.509
+  tool prints a serial."
+  9007199254740991)
+
+(defn integer-hex
+  "INTEGER content as lowercase hex, exactly as encoded.
+
+  For values `integer-value` refuses — serial numbers, RSA moduli. The leading
+  `00` DER requires on a positive value whose high bit is set is PRESENT, because
+  this is the encoding and not the number; two certificates whose serials differ
+  only in that octet are different certificates."
+  [{:asn1/keys [content]}]
+  (hex content))
+
 (defn integer-value
-  "INTEGER content as a number. Rejects the non-minimal encodings DER forbids."
+  "INTEGER content as a number. Rejects the non-minimal encodings DER forbids,
+  and refuses values too large to represent exactly on both platforms —
+  see `safe-integer-limit`."
   [{:asn1/keys [content]}]
   (let [ints (->ints content)]
     (when (empty? ints)
@@ -374,10 +399,24 @@
     ;; this -- it computes -(2^(8n) - 1 - unsigned), which is the answer plus
     ;; one. (Measured: every negative in the round-trip test came back one too
     ;; large.)
-    (let [unsigned (reduce (fn [acc b] (+ (* acc 256) b)) 0 ints)]
-      (if (pos? (bit-and (first ints) 0x80))
-        (- unsigned (reduce * 1 (repeat (count ints) 256)))
-        unsigned))))
+    ;; Checked before any arithmetic: 8 octets can already exceed the limit, and
+    ;; overflowing while computing the value we were about to refuse turns a
+    ;; clear refusal into an ArithmeticException from inside a reduce.
+    ;; (Measured: a 20-octet X.509 serial did exactly that.)
+    (when (> (count ints) 7)
+      (fail! :asn1/integer-too-large
+             (str "INTEGER is " (count ints)
+                  " octets — too large to represent exactly. Use integer-hex.")
+             {:octets (count ints) :hex (hex ints)}))
+    (let [unsigned (reduce (fn [acc b] (+ (* acc 256) b)) 0 ints)
+          value (if (pos? (bit-and (first ints) 0x80))
+                  (- unsigned (reduce * 1 (repeat (count ints) 256)))
+                  unsigned)]
+      (when (> (abs value) safe-integer-limit)
+        (fail! :asn1/integer-too-large
+               "INTEGER exceeds the exactly-representable range. Use integer-hex."
+               {:hex (hex ints)}))
+      value)))
 
 (defn octet-string [data] (universal :octet-string data))
 (defn null* [] (universal :null []))

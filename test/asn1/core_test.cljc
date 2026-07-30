@@ -249,3 +249,26 @@
   (let [parsed (asn1/decode (asn1/unhex "3003020101"))
         edited (assoc parsed :asn1/elements [(asn1/integer 2)])]
     (is (= "3003020102" (asn1/hex (asn1/encode-ints edited))))))
+
+(deftest oversized-integers-are-refused-rather-than-approximated
+  ;; An X.509 serial number is up to 20 octets. On :cljs a number is a double, so
+  ;; returning one would silently lose low bits — and CMS matches certificates BY
+  ;; serial, so two different certificates that round to the same double would
+  ;; match each other. (Measured: the 20-octet serial in the x509 fixtures threw
+  ;; an ArithmeticException from inside the reduce before this guard existed.)
+  (let [serial (asn1/decode (asn1/unhex "02142ee1b06995d7b8c61ef21ceb91b93703b38a9a67"))]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                          #"integer-hex"
+                          (asn1/integer-value serial)))
+    (testing "and integer-hex gives the exact encoding, leading 00 included"
+      (is (= "2ee1b06995d7b8c61ef21ceb91b93703b38a9a67" (asn1/integer-hex serial)))))
+
+  (testing "the boundary is the VALUE, not the octet count — 2^53-1 in, 2^53 out"
+    (is (= 9007199254740991
+           (asn1/integer-value (asn1/decode (asn1/unhex "02071fffffffffffff")))))
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+                          #"exactly-representable"
+                          (asn1/integer-value (asn1/decode (asn1/unhex "020720000000000000")))))
+    (testing "a 7-octet value below the limit is fine even though 7 octets CAN exceed it"
+      (is (= 1000000007 (asn1/integer-value (asn1/decode (asn1/unhex "0204 3b9aca07")))))))
+)
