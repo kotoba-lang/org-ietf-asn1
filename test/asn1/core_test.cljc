@@ -283,3 +283,34 @@
     (testing "a 7-octet value below the limit is fine even though 7 octets CAN exceed it"
       (is (= 1000000007 (asn1/integer-value (asn1/decode (asn1/unhex "0204 3b9aca07")))))))
 )
+
+(deftest a-value-that-cannot-be-encoded-exactly-on-both-platforms-is-refused
+  ;; Found by running this suite on nbb for the first time. On :cljs a number is
+  ;; a double, so `0x7d82213101890cc3` — an ordinary 64-bit RFC 3161 nonce — is
+  ;; already rounded before it reaches `integer`, and encoded to different bytes
+  ;; than the JVM produces for the same literal. Silent, platform-dependent, and
+  ;; inside a signed structure.
+  (testing "so `integer` refuses it rather than encoding something else"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"integer-from-hex"
+                          (asn1/integer 9043102282242822339)))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (asn1/integer -9043102282242822339))))
+
+  (testing "and integer-from-hex encodes the exact octets on both platforms"
+    (is (= "02087d82213101890cc3"
+           (asn1/hex (asn1/encode-ints (asn1/integer-from-hex "7d82213101890cc3")))))
+    (is (= "7d82213101890cc3"
+           (asn1/integer-hex (asn1/decode (asn1/unhex "02087d82213101890cc3"))))))
+
+  (testing "unsigned-integer-from-hex adds the leading 00 a positive value needs"
+    (is (= "020300ff01"
+           (asn1/hex (asn1/encode-ints (asn1/unsigned-integer-from-hex "ff01")))))
+    (testing "and strips a redundant one rather than emitting a non-minimal INTEGER"
+      (is (= "02020101"
+             (asn1/hex (asn1/encode-ints (asn1/unsigned-integer-from-hex "000101")))))))
+
+  (testing "the limit is unchanged for values that DO fit"
+    (is (= "0204 3b9aca07"
+           (str (subs (asn1/hex (asn1/encode-ints (asn1/integer 1000000007))) 0 4) " "
+                (subs (asn1/hex (asn1/encode-ints (asn1/integer 1000000007))) 4))))))

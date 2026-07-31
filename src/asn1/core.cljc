@@ -321,6 +321,19 @@
       (fail! :asn1/bad-oid "empty OID" {}))
     (str/join "." (into (fix-first-arcs (first arcs)) (rest arcs)))))
 
+(def safe-integer-limit
+  "The largest magnitude `integer-value` will return: 2^53 - 1.
+
+  Not a JVM limit — a portability one. `:cljs` numbers are doubles, so above
+  this an integer silently loses low bits, and an X.509 serial number is up to
+  20 octets. Returning an approximate serial number is worse than refusing:
+  `IssuerAndSerialNumber` matching in CMS compares serials, and two different
+  certificates that round to the same double would match each other.
+
+  Values above it are read with `integer-hex`, which is also how every X.509
+  tool prints a serial."
+  9007199254740991)
+
 ;; ── typed constructors ───────────────────────────────────────────────────────
 
 (defn- universal [type content & {:keys [constructed?]}]
@@ -337,13 +350,59 @@
   [v]
   (universal :boolean [(if v 0xff 0x00)]))
 
+(defn integer-from-hex
+  "INTEGER from a hex string of its two's-complement content octets.
+
+  For values `integer` refuses — a 64-bit RFC 3161 nonce, a certificate serial.
+  The caller supplies the exact octets, so nothing is rounded on the way in.
+
+  The leading `0x00` DER requires on a positive value whose high bit is set is
+  the CALLER's to include, because only they know whether the value is signed.
+  `unsigned-integer-from-hex` adds it."
+  [hex-string]
+  (universal :integer (unhex hex-string)))
+
+(defn unsigned-integer-from-hex
+  "INTEGER from hex, read as a non-negative number.
+
+  Adds the leading `0x00` when the high bit is set, and strips redundant leading
+  zeroes so the result is the minimal encoding DER requires."
+  [hex-string]
+  (let [ints (unhex hex-string)
+        trimmed (loop [v (vec ints)]
+                  (if (and (> (count v) 1) (zero? (first v))
+                           (zero? (bit-and (second v) 0x80)))
+                    (recur (subvec v 1))
+                    v))
+        trimmed (if (seq trimmed) trimmed [0])]
+    (universal :integer
+               (if (pos? (bit-and (first trimmed) 0x80))
+                 (into [0x00] trimmed)
+                 trimmed))))
+
 (defn integer
   "INTEGER, minimal two's-complement.
 
   Non-negative values get a leading `0x00` exactly when the high bit would
   otherwise make them negative; that byte is required, not padding, and omitting
-  it is the classic way to turn a modulus into a negative number."
+  it is the classic way to turn a modulus into a negative number.
+
+  **Refuses a value larger than `safe-integer-limit`**, symmetric with
+  `integer-value`. Not a nicety: on `:cljs` a number is a double, so a 64-bit
+  value is ALREADY rounded before it reaches this function, and encoding it
+  produces bytes that differ from the JVM's for the same source literal. That is
+  the worst kind of failure — silent, platform-dependent, and inside a signed
+  structure. (Measured: an RFC 3161 nonce `0x7d82213101890cc3` encoded as
+  `…890c00` on nbb and `…890cc3` on the JVM, which would have made every
+  timestamp response fail its nonce check for a reason nobody could see.)
+
+  Use `integer-from-hex` for anything larger."
   [n]
+  (when (> (abs n) safe-integer-limit)
+    (fail! :asn1/integer-too-large
+           (str "INTEGER " n " exceeds the exactly-representable range on :cljs. "
+                "Use integer-from-hex.")
+           {:value n}))
   (universal
    :integer
    (if (zero? n)
@@ -357,19 +416,6 @@
          (and (not negative?) (pos? (bit-and (first octets) 0x80))) (into [0x00] octets)
          (and negative? (zero? (bit-and (first octets) 0x80))) (into [0xff] octets)
          :else octets)))))
-
-(def safe-integer-limit
-  "The largest magnitude `integer-value` will return: 2^53 - 1.
-
-  Not a JVM limit — a portability one. `:cljs` numbers are doubles, so above
-  this an integer silently loses low bits, and an X.509 serial number is up to
-  20 octets. Returning an approximate serial number is worse than refusing:
-  `IssuerAndSerialNumber` matching in CMS compares serials, and two different
-  certificates that round to the same double would match each other.
-
-  Values above it are read with `integer-hex`, which is also how every X.509
-  tool prints a serial."
-  9007199254740991)
 
 (defn integer-hex
   "INTEGER content as lowercase hex, exactly as encoded.
