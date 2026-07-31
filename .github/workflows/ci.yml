@@ -20,3 +20,18 @@ jobs:
       - run: clojure -M:test
 
       - run: clojure -M:lint
+
+  # `.cljc` is a claim about two platforms and the JVM job checks one of them.
+  # This runs the SAME suite on nbb (SCI), which is where the claim was actually
+  # false: the test file named `cljs.core/ExceptionInfo`, which SCI cannot
+  # resolve, so the suite refused to load and nobody noticed.
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install -g nbb@1.3.197
+      - name: Test on nbb (ClojureScript)
+        run: nbb --classpath "src:test" run_tests.cljs

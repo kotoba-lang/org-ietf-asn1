@@ -10,6 +10,17 @@
             [asn1.core :as asn1]
             [asn1.oid :as oid]))
 
+;; `thrown?` and `thrown-with-msg?` take a CLASS NAME and resolve it at compile
+;; time, so the reader conditional has to be written out at each site — a `def`
+;; holding the type does not work on either platform.
+;;
+;; The `:cljs` branch is `js/Error`, which `ex-info` extends. NOT
+;; `cljs.core/ExceptionInfo`: that compiles under ClojureScript proper and is
+;; not resolvable in SCI, which is what `nbb` runs on. A suite naming it simply
+;; refuses to load — which is exactly how this file claimed portability for a
+;; day without ever having been run on the other platform. The `portable` CI job
+;; is what makes the claim mean something.
+
 ;; ── round trips over real DER ────────────────────────────────────────────────
 
 (def ^:private fixtures
@@ -84,43 +95,43 @@
 
 (deftest ber-is-refused-because-a-signature-is-over-bytes
   (testing "indefinite length"
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                           #"indefinite length"
                           (asn1/decode (asn1/unhex "3080020100 0000")))))
 
   (testing "non-minimal long-form length (0x81 0x05 for a length of 5)"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (asn1/decode (asn1/unhex "04810541424344 45")))))
 
   (testing "long-form length with a leading zero octet"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (asn1/decode (asn1/unhex (str "048200c8" (apply str (repeat 200 "41"))))))))
 
   (testing "constructed OCTET STRING — the same octets would have many encodings"
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                           #"constructed octet-string"
                           (asn1/decode (asn1/unhex "24 06 0402 4142 0402 4344")))))
 
   (testing "trailing bytes after the outermost element"
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                           #"bytes remain"
                           (asn1/decode (asn1/unhex "020100 020100")))))
 
   (testing "truncated content"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (asn1/decode (asn1/unhex "0405 4142")))))
 
   (testing "non-minimal INTEGER is refused when READ, so a modulus cannot arrive twice-spelled"
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                           #"redundant leading octet"
                           (asn1/integer-value (asn1/decode (asn1/unhex "0202 0001")))))
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (asn1/integer-value (asn1/decode (asn1/unhex "0202 ffff"))))))
 
   (testing "BOOLEAN 0x01 is BER; DER says true is 0xff"
     (is (true? (asn1/boolean-value (asn1/decode (asn1/unhex "0101ff")))))
     (is (false? (asn1/boolean-value (asn1/decode (asn1/unhex "010100")))))
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                           #"0x00 or 0xff"
                           (asn1/boolean-value (asn1/decode (asn1/unhex "010101")))))))
 
@@ -166,12 +177,12 @@
           (str name-kw))))
 
   (testing "a leading 0x80 septet is a second spelling of the same arc"
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                           #"leading 0x80"
                           (asn1/oid-value (asn1/decode (asn1/unhex "0603 80 8001"))))))
 
   (testing "an unknown OID NAME throws rather than becoming nil and matching nothing"
-    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                  (oid/dotted :sha256-with-rsaa)))
     (is (nil? (oid/named "1.2.3.4.5.6.7"))))
 
@@ -257,7 +268,7 @@
   ;; match each other. (Measured: the 20-octet serial in the x509 fixtures threw
   ;; an ArithmeticException from inside the reduce before this guard existed.)
   (let [serial (asn1/decode (asn1/unhex "02142ee1b06995d7b8c61ef21ceb91b93703b38a9a67"))]
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                           #"integer-hex"
                           (asn1/integer-value serial)))
     (testing "and integer-hex gives the exact encoding, leading 00 included"
@@ -266,7 +277,7 @@
   (testing "the boundary is the VALUE, not the octet count — 2^53-1 in, 2^53 out"
     (is (= 9007199254740991
            (asn1/integer-value (asn1/decode (asn1/unhex "02071fffffffffffff")))))
-    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                           #"exactly-representable"
                           (asn1/integer-value (asn1/decode (asn1/unhex "020720000000000000")))))
     (testing "a 7-octet value below the limit is fine even though 7 octets CAN exceed it"
