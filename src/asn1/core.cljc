@@ -43,7 +43,7 @@
   No clock, no network, no keys. Time values are parsed to strings and never to
   an instant, because `UTCTime`'s two-digit year needs a sliding window whose
   answer depends on when you ask."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def ^:private tag-classes
   {0 :universal 1 :application 2 :context 3 :private})
@@ -88,7 +88,7 @@
 (defn hex
   "Lowercase hex, for fixtures and error messages."
   [data]
-  (str/join (map #(let [s (str/lower-case
+  (str/join (map #(let [s (str/lower
                           #?(:clj (Integer/toHexString %)
                              :cljs (.toString % 16)))]
                     (if (= 1 (count s)) (str "0" s) s))
