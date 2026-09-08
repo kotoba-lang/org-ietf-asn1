@@ -11,7 +11,7 @@
   `describe` exists for the other direction: an error message that says
   `unsupported algorithm 1.2.840.113549.1.1.4` sends a reader to a search
   engine, and one that says `md5WithRSA` does not."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def oids
   "name → dotted string. Grouped by what each group is for."
