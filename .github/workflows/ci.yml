@@ -34,4 +34,4 @@ jobs:
           node-version: "22"
       - run: npm install -g nbb@1.4.208
       - name: Test on nbb (ClojureScript)
-        run: nbb --classpath "src:test" run_tests.cljs
+        run: nbb --classpath "src:test" run_tests.cljk
