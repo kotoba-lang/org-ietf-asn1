@@ -69,8 +69,8 @@ that looks computed.
 ## Test
 
 ```bash
-clojure -M:test
-clojure -M:lint
+kbb -M:test
+kbb -M:lint
 ```
 
 Apache-2.0.
